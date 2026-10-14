@@ -1,5 +1,7 @@
 #include "network_internal.h"
 
+#include "direct_online.h"
+
 namespace NetworkHle {
 
 static int32_t NewWiiSocket(uint32_t af, uint32_t type, uint32_t protocol) {
@@ -176,9 +178,15 @@ int32_t HandleIpTopIoctl(uint32_t cmd, uint32_t inBuf, uint32_t inLen, uint32_t 
             return -SO_EBADF;
         }
         sockaddr_in addr = ReadWiiSockAddr(inBuf + 8);
+        // addr stays guest-visible (it becomes peerAddr below); only the host
+        // connect sees the built-in server's loopback address.
+        sockaddr_in nativeAddr = addr;
+        if (cmd == IOCTL_SO_CONNECT) {
+            DirectOnline::ToNative(nativeAddr);
+        }
         const int ret = (cmd == IOCTL_SO_BIND)
             ? bind(s->native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))
-            : connect(s->native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            : connect(s->native, reinterpret_cast<sockaddr*>(&nativeAddr), sizeof(nativeAddr));
         int32_t result = 0;
         if (cmd == IOCTL_SO_CONNECT && ret < 0) {
             // Nonblocking connects only (blocking ones go through
@@ -222,6 +230,9 @@ int32_t HandleIpTopIoctl(uint32_t cmd, uint32_t inBuf, uint32_t inLen, uint32_t 
             ? getsockname(s->native, reinterpret_cast<sockaddr*>(&addr), &len)
             : getpeername(s->native, reinterpret_cast<sockaddr*>(&addr), &len);
         if (ret == 0) {
+            if (cmd == IOCTL_SO_GETPEERNAME) {
+                DirectOnline::ToGuest(addr);
+            }
             WriteWiiSockAddr(outBuf, addr, static_cast<uint32_t>(len));
         }
         return SocketResult(ret, false);
@@ -463,13 +474,24 @@ int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const s
 
         const bool patchedWrite = nasAction == NasSslWriteAction::Ready;
         const uint8_t* sendData = patchedWrite ? patched.data() : data;
-        const uint32_t sendSize = patchedWrite ? static_cast<uint32_t>(patched.size()) : in[0].size;
+        uint32_t sendSize = patchedWrite ? static_cast<uint32_t>(patched.size()) : in[0].size;
+        // Direct-connect online: datagrams for WFC servers and other players
+        // travel wrapped to the host's relay.
+        std::vector<uint8_t> tunneled;
+        sockaddr_in relay{};
+        const bool wrapped = destPtr && s->type == SOCK_DGRAM &&
+            DirectOnline::WrapDatagram(s->native, dest, sendData, sendSize, tunneled, relay);
+        if (wrapped) {
+            dest = relay;
+            sendData = tunneled.data();
+            sendSize = static_cast<uint32_t>(tunneled.size());
+        }
         const int ret = sendto(s->native, reinterpret_cast<const char*>(sendData), static_cast<int>(sendSize),
                                static_cast<int>(flags), destPtr, destLen);
         const int hostError = ret < 0 ? NativeLastError() : 0;
         // Diagnostics may change the native error; use the send result captured above.
         int32_t result = ret >= 0 ? SocketResult(ret) : SocketErrorResult(hostError);
-        if (patchedWrite && ret == static_cast<int>(sendSize)) {
+        if ((patchedWrite || wrapped) && ret == static_cast<int>(sendSize)) {
             result = static_cast<int32_t>(in[0].size);
         }
         // A blocked send is routine; anything else aborts the connection, and
@@ -493,10 +515,35 @@ int32_t HandleIpTopIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const s
         socklen_t fromLen = sizeof(from);
         sockaddr* fromPtr = out.size() > 1 && out[1].address && out[1].size >= 8 ? reinterpret_cast<sockaddr*>(&from) : nullptr;
         int ret = 0;
+        int nativeErr = 0;
 
-        ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), fromPtr,
-                       fromPtr ? &fromLen : nullptr);
-        int nativeErr = ret < 0 ? NativeLastError() : 0;
+        if (s->type == SOCK_DGRAM && DirectOnline::Enabled()) {
+            // Direct-connect online: datagrams from the host's relay carry a
+            // header naming their real sender, which the guest must see as the
+            // source. Room for it is added so a full-size payload still fits.
+            std::vector<uint8_t> datagram(out[0].size + DirectOnline::kDatagramHeaderSize);
+            sockaddr_in source{};
+            socklen_t sourceLen = sizeof(source);
+            ret = recvfrom(s->native, reinterpret_cast<char*>(datagram.data()), static_cast<int>(datagram.size()),
+                           static_cast<int>(flags), reinterpret_cast<sockaddr*>(&source), &sourceLen);
+            nativeErr = ret < 0 ? NativeLastError() : 0;
+            if (ret >= 0) {
+                datagram.resize(static_cast<size_t>(ret));
+                sockaddr_in guestSource = source;
+                DirectOnline::UnwrapDatagram(source, datagram, guestSource);
+                const size_t copied = std::min<size_t>(datagram.size(), out[0].size);
+                if (copied) {
+                    std::memcpy(data, datagram.data(), copied);
+                }
+                ret = static_cast<int>(copied);
+                from = guestSource;
+                fromLen = sizeof(from);
+            }
+        } else {
+            ret = recvfrom(s->native, data, static_cast<int>(out[0].size), static_cast<int>(flags), fromPtr,
+                           fromPtr ? &fromLen : nullptr);
+            nativeErr = ret < 0 ? NativeLastError() : 0;
+        }
         // Nonblocking sockets get -SO_EAGAIN immediately (Dolphin's retry predicate
         // short-circuits on nonBlock/forceNonBlock, IOS/Network/Socket.cpp:715-718);
         // waiting here anyway stalled the whole emulation thread on every empty read.

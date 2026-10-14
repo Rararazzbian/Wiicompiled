@@ -1,5 +1,6 @@
 #include "network_internal.h"
 
+#include "direct_online.h"
 #include "fiber_manager.h"
 #include "hle/net/network.h"
 #include "ppc_runtime.h"
@@ -230,6 +231,37 @@ static DeferredDnsCompletion ResolveDeferredDns(DeferredDnsWork work) {
             hints.ai_family = AF_INET;
         }
         hintPtr = &hints;
+    }
+
+    // Direct-connect online: every WFC name is the built-in server's placeholder
+    // address, which the socket layer rewrites to its loopback listeners.
+    // InetAton is included: GameSpy tries inet_aton on the hostname before
+    // gethostbyname, and getaddrinfo below would resolve it through real DNS.
+    if (DirectOnline::Enabled() && DirectOnline::IsWfcHost(completion.work.node)) {
+        DirectOnline::Log("dns %s '%s' -> built-in server",
+                DeferredDnsKindName(completion.work.kind), completion.work.node.c_str());
+        sockaddr_in placeholder{};
+        placeholder.sin_family = AF_INET;
+        placeholder.sin_addr.s_addr = htonl(DirectOnline::kPlaceholderIp);
+        if (!completion.work.service.empty()) {
+            uint16_t port = 0;
+            const std::string& service = completion.work.service;
+            std::from_chars(service.data(), service.data() + service.size(), port);
+            placeholder.sin_port = htons(port);
+        }
+        addrinfo entry{};
+        entry.ai_family = AF_INET;
+        entry.ai_socktype = completion.work.hasHints ? completion.work.hintSockType : 0;
+        entry.ai_protocol = completion.work.hasHints ? completion.work.hintProtocol : 0;
+        entry.ai_addrlen = sizeof(placeholder);
+        entry.ai_addr = reinterpret_cast<sockaddr*>(&placeholder);
+        if (auto normalized = NormalizeDeferredDnsAddress(entry)) {
+            completion.addresses.push_back(std::move(*normalized));
+        }
+        completion.result = completion.addresses.empty()
+            ? DeferredDnsFailureResult(completion.work.kind)
+            : 0;
+        return completion;
     }
 
     addrinfo* nativeResults = nullptr;
@@ -696,8 +728,11 @@ static bool InstallDeferredConnect(DeferredConnectWork work) {
     if (!DeferredConnectSocketIsStillValid(work)) {
         work.initialResult = -SO_EBADF;
     } else {
-        const int ret = connect(work.nativeFd, reinterpret_cast<sockaddr*>(&work.peerAddress),
-                                sizeof(work.peerAddress));
+        // peerAddress stays guest-visible; only the host connect is rewritten.
+        sockaddr_in nativeAddress = work.peerAddress;
+        DirectOnline::ToNative(nativeAddress);
+        const int ret = connect(work.nativeFd, reinterpret_cast<sockaddr*>(&nativeAddress),
+                                sizeof(nativeAddress));
         if (ret == 0) {
             work.initialResult = 0;
         } else {

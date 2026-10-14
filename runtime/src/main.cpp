@@ -76,6 +76,9 @@
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
 
+// hle/net/direct_online.cpp
+extern "C" void DirectOnline_StartHostAtLaunch();
+
 // Defined in `runtime/src/hle/vi.cpp` (used by GX/VI HLE).
 extern std::atomic_bool g_auroraFrameActive;
 extern "C" int g_gxFrameCount;
@@ -1340,6 +1343,8 @@ int RuntimeMain(int argc, char** argv) {
             DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Mario Kart Wii");
         }
         SystemBridge::Initialize();
+        // Direct-connect online: a host's server runs from launch to exit.
+        DirectOnline_StartHostAtLaunch();
         TranslatedFunctionRegistry::Finalize();
 
         // Initialize Aurora (graphics backend)
@@ -1370,7 +1375,9 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.windowHeight = RuntimeConfigFile::WindowHeight(auroraConfig.windowHeight);
         auroraConfig.hasWindowPosition = RuntimeConfigFile::WindowPosition(
             auroraConfig.windowPosX, auroraConfig.windowPosY);
-        auroraConfig.allowJoystickBackgroundEvents = true;
+        // [controller] background_input = false: only the focused window
+        // reads controllers (e.g. two instances on one PC).
+        auroraConfig.allowJoystickBackgroundEvents = RuntimeConfigFile::BackgroundInput(true);
         auroraConfig.disableCopyFilter = RuntimeConfigFile::DisableCopyFilter(true);
         // Dolphin-style custom textures. Aurora indexes <userPath>/texture_replacements
         // once during aurora_initialize, so both knobs only take effect on the next launch.

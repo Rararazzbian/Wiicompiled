@@ -1,6 +1,7 @@
 #include "network_internal.h"
 
 #include "console_identity.h"
+#include "direct_online.h"
 #include "hle/net/network.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
@@ -428,7 +429,9 @@ int32_t ReconnectWiiSocket(WiiSocket& socket, uint16_t port) {
     SetNonBlocking(native, true);
     sockaddr_in addr = socket.peerAddr;
     addr.sin_port = htons(port);
-    const int ret = connect(native, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    sockaddr_in nativeAddr = addr;
+    DirectOnline::ToNative(nativeAddr);
+    const int ret = connect(native, reinterpret_cast<sockaddr*>(&nativeAddr), sizeof(nativeAddr));
     const int nativeErr = ret < 0 ? NormalizeConnectError(NativeLastError()) : 0;
     int32_t result = 0;
     if (ret < 0 && IsWouldBlockError(nativeErr)) {
@@ -691,12 +694,27 @@ extern "C" int32_t Network_HLE_Close(uint32_t fd) {
     return 0;
 }
 
+static const char* DeviceKindName(DeviceKind kind) {
+    switch (kind) {
+    case DeviceKind::KdRequest: return "kd/request";
+    case DeviceKind::KdTime: return "kd/time";
+    case DeviceKind::NcdManage: return "ncd";
+    case DeviceKind::IpTop: return "ip/top";
+    case DeviceKind::Ssl: return "ssl";
+    }
+    return "?";
+}
+
 extern "C" int32_t Network_HLE_Ioctl(uint32_t fd, uint32_t cmd, uint32_t inBuf, uint32_t inLen,
                                       uint32_t outBuf, uint32_t outLen) {
     const auto device = GetDeviceKind(fd);
     if (!device) {
         return -101;
     }
+    if (DirectOnline::Enabled()) {
+        DirectOnline::FriendListTick();
+    }
+    DirectOnline::SlowCallProbe probe(DeviceKindName(*device), cmd);
     switch (*device) {
     case DeviceKind::KdRequest:
         return HandleKdIoctl(cmd, inBuf, inLen, outBuf, outLen);
@@ -731,6 +749,7 @@ extern "C" int32_t Network_HLE_Ioctlv(uint32_t fd, uint32_t cmd, uint32_t numIn,
     const std::vector<IoVector> in(vectors.begin(), vectors.begin() + numIn);
     const std::vector<IoVector> out(vectors.begin() + numIn, vectors.end());
 
+    DirectOnline::SlowCallProbe probe(DeviceKindName(*device), cmd);
     switch (*device) {
     case DeviceKind::NcdManage:
         return HandleNcdIoctlv(cmd, in, out);

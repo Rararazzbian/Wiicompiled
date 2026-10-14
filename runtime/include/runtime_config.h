@@ -48,6 +48,7 @@ struct RuntimeUserConfig {
     std::optional<bool> textureReplacements;
     std::optional<bool> textureDumps;
     std::optional<bool> showFps;
+    std::optional<bool> backgroundInput;
     std::optional<uint32_t> disabledPostProcessingPaths;
     std::optional<float> audioVolume;
     std::optional<float> audioMusicVolume;
@@ -77,6 +78,14 @@ struct RuntimeUserConfig {
     // corrected accelerometer, buttons) to wii_accel_trace.csv next to Config.toml.
     std::optional<bool> wiiAccelTrace;
     std::optional<bool> networkEnabled;
+    // Direct-connect online: every WFC hostname is served by the runtime's own
+    // built-in server instead of a public one (hle/net/direct_online.cpp).
+    std::optional<bool> onlineDirect;
+    // Direct mode roles: host = accept other players on onlinePort; connect =
+    // "address:port" of a host to play through. Neither = play alone.
+    std::optional<bool> onlineHost;
+    std::optional<uint32_t> onlinePort;
+    std::optional<std::string> onlineConnect;
     std::optional<bool> discordPresenceEnabled;
     // The application ID of the WiiCompiled Discord application. This is only
     // used by the base product; Retro Rewind supplies its own ID through the
@@ -415,6 +424,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     }
 
     config.rumbleEnabled = FindConfigValue<bool>(document, "controller", "rumble");
+    config.backgroundInput = FindConfigValue<bool>(document, "controller", "background_input");
     if (auto value = FindConfigInt(document, "audio", "mute_key")) {
         config.muteHotkey = *value;
     }
@@ -492,6 +502,12 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.wiiAccelOffsetZ = FindConfigValue<double>(document, "controller", "wii_accel_offset_z");
     config.wiiAccelTrace = FindConfigValue<bool>(document, "controller", "wii_accel_trace");
     config.networkEnabled = FindConfigValue<bool>(document, "network", "enabled");
+    config.onlineDirect = FindConfigValue<bool>(document, "online", "direct");
+    config.onlineHost = FindConfigValue<bool>(document, "online", "host");
+    if (auto value = FindConfigUint(document, "online", "port"); value && *value > 0 && *value <= 65535) {
+        config.onlinePort = *value;
+    }
+    config.onlineConnect = FindConfigValue<std::string>(document, "online", "connect");
     config.discordPresenceEnabled = FindConfigValue<bool>(document, "discord", "enabled");
     config.discordClientId = FindConfigValue<std::string>(document, "discord", "client_id");
 
@@ -937,6 +953,11 @@ inline bool ShowFps(bool fallback = true) {
     return Get().showFps.value_or(fallback);
 }
 
+// Whether controllers keep driving the game while its window is unfocused.
+inline bool BackgroundInput(bool fallback = true) {
+    return Get().backgroundInput.value_or(fallback);
+}
+
 inline bool TextureReplacements(bool fallback = false) {
     return Get().textureReplacements.value_or(fallback);
 }
@@ -961,6 +982,22 @@ inline std::string DisplayMode(std::string fallback = "windowed") {
 
 inline bool NetworkEnabled(bool fallback = true) {
     return Get().networkEnabled.value_or(fallback);
+}
+
+inline bool OnlineDirect(bool fallback = false) {
+    return Get().onlineDirect.value_or(fallback);
+}
+
+inline bool OnlineHost(bool fallback = false) {
+    return Get().onlineHost.value_or(fallback);
+}
+
+inline uint32_t OnlinePort(uint32_t fallback) {
+    return Get().onlinePort.value_or(fallback);
+}
+
+inline std::string OnlineConnect(std::string fallback = "") {
+    return Get().onlineConnect.value_or(std::move(fallback));
 }
 
 inline std::string NandRoot(std::string fallback = "") {
@@ -1061,6 +1098,9 @@ inline void LogLoadedConfig() {
             }
             if (config.networkEnabled) {
                 std::cout << " network_enabled=" << (*config.networkEnabled ? "true" : "false");
+            }
+            if (config.onlineDirect) {
+                std::cout << " online_direct=" << (*config.onlineDirect ? "true" : "false");
             }
             if (config.discordPresenceEnabled) {
                 std::cout << " discord_enabled=" << (*config.discordPresenceEnabled ? "true" : "false");

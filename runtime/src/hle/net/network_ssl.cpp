@@ -1,4 +1,5 @@
 #include "network_internal.h"
+#include "direct_online.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
 
@@ -921,7 +922,11 @@ int32_t HandleSslIoctlv(uint32_t cmd, const std::vector<IoVector>& in, const std
         ssl.plaintextWfc = false;
         socket->nonblocking = false;
         SetNonBlocking(socket->native, false);
-        if (IsRetroPlaintextSslHost(ssl.hostname) && socket->peerPort == 443) {
+        if (DirectOnline::Enabled() && DirectOnline::IsWfcHost(ssl.hostname)) {
+            // The built-in server speaks plain HTTP on its 443 listener too, so
+            // there is no TLS to run and no reroute to port 80.
+            ssl.plaintextWfc = true;
+        } else if (IsRetroPlaintextSslHost(ssl.hostname) && socket->peerPort == 443) {
             const int32_t reroute = ReconnectWiiSocket(*socket, 80);
             if (reroute != 0) {
                 WriteSslReturn(in, SSL_ERR_SYSCALL);
